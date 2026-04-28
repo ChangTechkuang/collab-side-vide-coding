@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id            String       @id @default(cuid())
+  email         String       @unique
+  passwordHash  String
+  name          String?
+  createdAt     DateTime     @default(now())
+  memberships   Membership[]
+  ownedProjects Project[]    @relation("ProjectOwner")
+}
+
+model Project {
+  id             String       @id @default(cuid())
+  title          String
+  ownerId        String
+  owner          User         @relation("ProjectOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  slides         Slide[]
+  members        Membership[]
+  // Slide dimensions in inches. Default is widescreen (13.333 x 7.5).
+  // Imported decks override these to match the source.
+  slideWidthIn   Float        @default(13.333)
+  slideHeightIn  Float        @default(7.5)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([ownerId])
+}
+
+model Slide {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  order     Int
+  content   Json
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId, order])
+}
+
+model Membership {
+  id        String  @id @default(cuid())
+  userId    String
+  projectId String
+  role      Role    @default(VIEWER)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, projectId])
+  @@index([projectId])
+}
+
+enum Role {
+  OWNER
+  EDITOR
+  VIEWER
+}

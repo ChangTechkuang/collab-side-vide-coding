@@ -39,3 +39,25 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Claude Code per-project state
+.claude/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# macOS extras
+.AppleDouble
+.LSOverride
+
+# misc temp / backup
+*.bak
+*.tmp
+*.log
