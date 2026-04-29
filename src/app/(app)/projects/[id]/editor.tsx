@@ -906,20 +906,12 @@ function EditableBlock({
       onPointerDown={onPointerDown}
       onDoubleClick={onDoubleClick}
     >
-      <div
-        className={`relative h-full w-full overflow-hidden rounded-[1px] ${
-          selected
-            ? 'outline outline-2 outline-blue-500'
-            : 'outline outline-1 outline-transparent group-hover:outline-blue-300'
-        }`}
-      >
-        <BlockBody
-          slideId={slideId}
-          block={block}
-          editing={editing}
-          onCommitEdit={() => editBlock(null)}
-        />
-      </div>
+      <BlockBody
+        slideId={slideId}
+        block={block}
+        editing={editing}
+        onCommitEdit={() => editBlock(null)}
+      />
       {selected && !editing && (
         <ResizeHandles
           slideId={slideId}

@@ -74,6 +74,25 @@ function xfrmToBox(xfrm: Xfrm | undefined, size: SlideSize, fallback: Xfrm) {
 // generic text — substitute with a normal Unicode bullet.
 const SYMBOL_FONT_RE = /Wingdings|Symbol|Webdings|Marlett/i
 
+// Approximate Wingdings/Symbol → Unicode bullet mapping. PPTX often uses
+// ASCII letters paired with a symbol font for bullet glyphs; without the
+// font, those render as plain letters. Substitute with the closest Unicode
+// shape so the bullet looks right regardless of installed fonts.
+const SYMBOL_BULLET_MAP: Record<string, string> = {
+  l: '◆', // Wingdings level-1 bullet (commonly diamond in Korean templates)
+  m: '◆',
+  n: '■',
+  o: '□',
+  p: '★',
+  q: '◇',
+  s: '▲',
+  t: '▼',
+  u: '◆',
+  v: '◆',
+  w: '◇',
+  '§': '◆',
+}
+
 function paragraphBulletPrefix(paraXml: string): string {
   // Only honor an explicit bullet in this paragraph's pPr. We don't resolve
   // master/layout inheritance, so paragraphs that inherit a bullet won't get
@@ -83,10 +102,11 @@ function paragraphBulletPrefix(paraXml: string): string {
   if (buChar && buChar[1]) {
     const ch = decodeXmlEntities(buChar[1])
     const buFont = paraXml.match(/<a:buFont\s+[^>]*typeface="([^"]+)"/)
-    if (buFont && SYMBOL_FONT_RE.test(buFont[1])) return '• '
-    // A single ASCII letter as a bullet is almost always a symbol-font char
-    // that's been mis-decoded; promote to a normal bullet.
-    if (/^[A-Za-z]$/.test(ch)) return '• '
+    const isSymbolFont = !!(buFont && SYMBOL_FONT_RE.test(buFont[1]))
+    if (isSymbolFont || /^[A-Za-z]$/.test(ch)) {
+      return (SYMBOL_BULLET_MAP[ch] ?? '◆') + ' '
+    }
+    // Real Unicode bullet character — pass through.
     return ch + ' '
   }
   if (/<a:buAutoNum\b/.test(paraXml)) return '• '
@@ -245,14 +265,19 @@ function extractFirstRunStyle(shapeXml: string): {
   return out
 }
 
-async function readImageEmbeds(
+// Generic rels-file reader that resolves image targets relative to whichever
+// XML owns the rels (slide, slideLayout, slideMaster, etc.). Returns a map
+// from rId → data URL.
+async function readImageEmbedsForXml(
   zip: JSZip,
-  slidePath: string,
+  xmlPath: string,
 ): Promise<Map<string, string>> {
-  // Returns: rId -> data URL.
-  const m = slidePath.match(/^ppt\/slides\/(slide\d+)\.xml$/)
-  if (!m) return new Map()
-  const relsPath = `ppt/slides/_rels/${m[1]}.xml.rels`
+  // xmlPath: "ppt/slides/slide1.xml"  →  rels: "ppt/slides/_rels/slide1.xml.rels"
+  // xmlPath: "ppt/slideLayouts/slideLayout1.xml" → ppt/slideLayouts/_rels/slideLayout1.xml.rels
+  const dirAndFile = xmlPath.match(/^(.*\/)([^/]+\.xml)$/)
+  if (!dirAndFile) return new Map()
+  const [, dir, file] = dirAndFile
+  const relsPath = `${dir}_rels/${file}.rels`
   const relsXml = await zip.file(relsPath)?.async('string')
   if (!relsXml) return new Map()
 
@@ -260,11 +285,20 @@ async function readImageEmbeds(
   const relRe =
     /<Relationship\s+[^>]*Id="([^"]+)"[^>]*Type="[^"]*\/image"[^>]*Target="([^"]+)"/g
   for (const rel of relsXml.matchAll(relRe)) {
-    const rId = rel[1]
-    const target = rel[2].replace(/^\.\.\//, 'ppt/')
-    const file = zip.file(target)
-    if (!file) continue
-    const ext = target.split('.').pop()?.toLowerCase() ?? 'png'
+    const target = rel[2]
+    // Resolve relative to the rels directory. "../media/img.png" rooted at
+    // ppt/slides/_rels/ → ppt/media/img.png. Targets without "../" are
+    // relative to the dir owning the XML.
+    let resolved: string
+    if (target.startsWith('../')) {
+      const parent = dir.replace(/[^/]+\/$/, '') // ppt/slides/ → ppt/
+      resolved = parent + target.slice(3)
+    } else {
+      resolved = dir + target
+    }
+    const f = zip.file(resolved)
+    if (!f) continue
+    const ext = resolved.split('.').pop()?.toLowerCase() ?? 'png'
     const mime =
       ext === 'jpg' || ext === 'jpeg'
         ? 'image/jpeg'
@@ -273,10 +307,52 @@ async function readImageEmbeds(
           : ext === 'svg'
             ? 'image/svg+xml'
             : 'image/png'
-    const buf = await file.async('base64')
-    out.set(rId, `data:${mime};base64,${buf}`)
+    const buf = await f.async('base64')
+    out.set(rel[1], `data:${mime};base64,${buf}`)
   }
   return out
+}
+
+// Resolve the slideLayout XML path referenced by a slide's rels.
+async function findLayoutPath(
+  zip: JSZip,
+  slideXmlPath: string,
+): Promise<string | null> {
+  const dirAndFile = slideXmlPath.match(/^(.*\/)([^/]+\.xml)$/)
+  if (!dirAndFile) return null
+  const [, dir, file] = dirAndFile
+  const relsXml = await zip.file(`${dir}_rels/${file}.rels`)?.async('string')
+  if (!relsXml) return null
+  const m = relsXml.match(
+    /<Relationship\s+[^>]*Type="[^"]*\/slideLayout"[^>]*Target="([^"]+)"/,
+  )
+  if (!m) return null
+  const target = m[1]
+  if (target.startsWith('../')) {
+    return dir.replace(/[^/]+\/$/, '') + target.slice(3)
+  }
+  return dir + target
+}
+
+// Resolve the slideMaster XML path referenced by a layout's rels.
+async function findMasterPath(
+  zip: JSZip,
+  layoutXmlPath: string,
+): Promise<string | null> {
+  const dirAndFile = layoutXmlPath.match(/^(.*\/)([^/]+\.xml)$/)
+  if (!dirAndFile) return null
+  const [, dir, file] = dirAndFile
+  const relsXml = await zip.file(`${dir}_rels/${file}.rels`)?.async('string')
+  if (!relsXml) return null
+  const m = relsXml.match(
+    /<Relationship\s+[^>]*Type="[^"]*\/slideMaster"[^>]*Target="([^"]+)"/,
+  )
+  if (!m) return null
+  const target = m[1]
+  if (target.startsWith('../')) {
+    return dir.replace(/[^/]+\/$/, '') + target.slice(3)
+  }
+  return dir + target
 }
 
 // Build a single TableBlock from a <p:graphicFrame> containing <a:tbl>.
@@ -369,6 +445,10 @@ async function parseSlideXml(
   slideXml: string,
   size: SlideSize,
   embeds: Map<string, string>,
+  // When true, treat this XML as a layout/master template — skip text
+  // shapes that are placeholders (<p:ph>), since those are content-prompts
+  // (e.g. "Click to add title") that the actual slide overrides.
+  isTemplate = false,
 ): Promise<Block[]> {
   const blocks: Block[] = []
 
@@ -377,8 +457,17 @@ async function parseSlideXml(
   let shapeIdx = 0
   for (const m of slideXml.matchAll(shapeRe)) {
     const shapeXml = m[1]
+    if (isTemplate && /<p:ph\b/.test(shapeXml)) {
+      shapeIdx++
+      continue
+    }
     const text = extractParagraphsText(shapeXml)
     if (!text.trim()) {
+      // Shapes without text can still be decorative — divider strips,
+      // accent rectangles, etc. If they have a fill or outline color,
+      // extract as a LineBlock at their bounding box.
+      const lb = extractEmptyShapeAsLine(shapeXml, size)
+      if (lb) blocks.push(lb)
       shapeIdx++
       continue
     }
@@ -450,28 +539,134 @@ async function parseSlideXml(
   return blocks
 }
 
+// Theme color references (<a:schemeClr>) point at the master's color theme.
+// We don't resolve themes; this is the visible default for unresolved lines.
+const SCHEME_COLOR_FALLBACK = '#5B6770'
+const DEFAULT_LINE_THICKNESS_EMU = 12700 // 1pt
+
 function extractLineBlock(
   cxnXml: string,
   size: SlideSize,
 ): LineBlock | null {
   const xfrm = parseXfrm(cxnXml)
   if (!xfrm) return null
-  // Line color: first <a:solidFill><a:srgbClr> inside <a:ln>.
-  const colorM = cxnXml.match(
+
+  // Line color from <a:ln><a:solidFill><a:srgbClr>; if missing, check
+  // <a:schemeClr> and substitute a generic dark gray.
+  const rgb = cxnXml.match(
     /<a:ln\b[^>]*>[\s\S]*?<a:solidFill>\s*<a:srgbClr\s+val="([0-9A-Fa-f]{6})"/,
+  )?.[1]
+  const hasSchemeColor =
+    !rgb &&
+    /<a:ln\b[^>]*>[\s\S]*?<a:solidFill>\s*<a:schemeClr/.test(cxnXml)
+  const color = rgb
+    ? '#' + rgb.toUpperCase()
+    : hasSchemeColor
+      ? SCHEME_COLOR_FALLBACK
+      : undefined
+
+  // Line thickness: <a:ln w="..."> in EMU.
+  const wEmu = Number(
+    cxnXml.match(/<a:ln\b[^>]*\sw="(\d+)"/)?.[1] ?? DEFAULT_LINE_THICKNESS_EMU,
   )
-  // Line thickness: <a:ln w="..."> in EMU; 1pt = 12700 EMU.
-  const wM = cxnXml.match(/<a:ln\b[^>]*\sw="(\d+)"/)
+
+  // PPTX "logical lines" often have cy=0 (or cx=0) — the line is drawn
+  // diagonally inside the bounding box. For our solid-fill render we need
+  // a non-zero box; inflate to the line thickness on the collapsed axis.
+  const cx = xfrm.cx === 0 ? wEmu : xfrm.cx
+  const cy = xfrm.cy === 0 ? wEmu : xfrm.cy
+
   return {
     id: randomUUID(),
     type: 'line',
     x: clamp01(xfrm.x / size.cx),
     y: clamp01(xfrm.y / size.cy),
-    w: clamp01(xfrm.cx / size.cx),
-    h: clamp01(xfrm.cy / size.cy),
-    ...(colorM ? { color: '#' + colorM[1].toUpperCase() } : {}),
-    ...(wM ? { thickness: Number(wM[1]) / 12700 } : {}),
+    w: clamp01(cx / size.cx),
+    h: clamp01(cy / size.cy),
+    ...(color ? { color } : {}),
+    thickness: wEmu / 12700,
   }
+}
+
+// Many decks build divider lines and accent strips with empty <p:sp>
+// rectangles that have a solid fill or outline. These would otherwise be
+// filtered out by our "no text → skip" rule. Extract them as LineBlocks at
+// their bounding box. Capped at 50% of slide area to avoid sucking in
+// full-page background fills.
+function extractEmptyShapeAsLine(
+  shapeXml: string,
+  size: SlideSize,
+): LineBlock | null {
+  const xfrm = parseXfrm(shapeXml)
+  if (!xfrm) return null
+
+  // Skip huge shapes — likely background fills, not decorations.
+  // Use max(cx*cy, 1) to avoid divide-by-zero for collapsed (line-like) shapes.
+  const areaFrac = (xfrm.cx * xfrm.cy) / (size.cx * size.cy)
+  if (areaFrac > 0.5) return null
+
+  const isLineGeom =
+    /<a:prstGeom\s+[^>]*prst="(line|straightConnector1|straightConnector2|straightConnector3)"/.test(
+      shapeXml,
+    )
+
+  // Resolve fill / outline color, preferring explicit srgb. Fall back to a
+  // generic dark gray when only a theme reference is present.
+  const fillRgb = shapeXml.match(
+    /<p:spPr\b[^>]*>[\s\S]*?<a:solidFill>\s*<a:srgbClr\s+val="([0-9A-Fa-f]{6})"/,
+  )?.[1]
+  const lnRgb = shapeXml.match(
+    /<a:ln\b[^>]*>[\s\S]*?<a:solidFill>\s*<a:srgbClr\s+val="([0-9A-Fa-f]{6})"/,
+  )?.[1]
+  const hasFillScheme =
+    !fillRgb &&
+    /<p:spPr\b[^>]*>[\s\S]*?<a:solidFill>\s*<a:schemeClr/.test(shapeXml)
+  const hasLnScheme =
+    !lnRgb &&
+    /<a:ln\b[^>]*>[\s\S]*?<a:solidFill>\s*<a:schemeClr/.test(shapeXml)
+
+  const rgb = fillRgb ?? lnRgb
+  const usesScheme = hasFillScheme || hasLnScheme
+  if (!rgb && !usesScheme && !isLineGeom) return null
+
+  const color = rgb
+    ? '#' + rgb.toUpperCase()
+    : usesScheme
+      ? SCHEME_COLOR_FALLBACK
+      : SCHEME_COLOR_FALLBACK
+
+  const wEmu = Number(
+    shapeXml.match(/<a:ln\b[^>]*\sw="(\d+)"/)?.[1] ?? DEFAULT_LINE_THICKNESS_EMU,
+  )
+  // Inflate collapsed axis so a zero-height/width "logical line" still has
+  // a visible rendered box.
+  const cx = xfrm.cx === 0 ? wEmu : xfrm.cx
+  const cy = xfrm.cy === 0 ? wEmu : xfrm.cy
+
+  return {
+    id: randomUUID(),
+    type: 'line',
+    x: clamp01(xfrm.x / size.cx),
+    y: clamp01(xfrm.y / size.cy),
+    w: clamp01(cx / size.cx),
+    h: clamp01(cy / size.cy),
+    color,
+    thickness: wEmu / 12700,
+  }
+}
+
+// Parse a slideLayout or slideMaster XML, returning its decoration blocks
+// (logos, divider lines, footer text shapes). Placeholder shapes are
+// filtered out — they're prompts that the actual slide overrides.
+async function parseTemplateBlocks(
+  zip: JSZip,
+  templatePath: string,
+  size: SlideSize,
+): Promise<Block[]> {
+  const xml = await zip.file(templatePath)?.async('string')
+  if (!xml) return []
+  const embeds = await readImageEmbedsForXml(zip, templatePath)
+  return parseSlideXml(xml, size, embeds, /* isTemplate */ true)
 }
 
 async function parsePptxWithSize(
@@ -490,15 +685,72 @@ async function parsePptxWithSize(
     throw new Error('No slides found in .pptx (is the file valid?)')
   }
 
+  // Cache layout + master parsing — every slide in a deck typically shares
+  // the same layout/master, so this avoids repeated XML reads.
+  const templateCache = new Map<string, Block[]>()
+  async function getTemplateBlocks(path: string): Promise<Block[]> {
+    const cached = templateCache.get(path)
+    if (cached) return cached
+    const blocks = await parseTemplateBlocks(zip, path, size)
+    templateCache.set(path, blocks)
+    return blocks
+  }
+
   const slides: SlideContent[] = []
   for (const slidePath of slidePaths) {
     const xml = await zip.file(slidePath)!.async('string')
-    const embeds = await readImageEmbeds(zip, slidePath)
-    const blocks = await parseSlideXml(xml, size, embeds)
+    const embeds = await readImageEmbedsForXml(zip, slidePath)
+    const slideBlocks = await parseSlideXml(xml, size, embeds, false)
+
+    // Walk layout + master. Master goes at the bottom of the z-order
+    // (rendered first), then layout, then slide on top.
+    const layoutPath = await findLayoutPath(zip, slidePath)
+    const masterPath = layoutPath ? await findMasterPath(zip, layoutPath) : null
+    const masterBlocks = masterPath ? await getTemplateBlocks(masterPath) : []
+    const layoutBlocks = layoutPath ? await getTemplateBlocks(layoutPath) : []
+
+    const blocks = dropTableBackdropLines([
+      ...masterBlocks,
+      ...layoutBlocks,
+      ...slideBlocks,
+    ])
     const background = extractSlideBackground(xml)
     slides.push({ blocks, ...(background ? { background } : {}) })
   }
   return slides
+}
+
+// True when `inner` sits inside `outer` (with a small float-tolerance
+// epsilon). Used to decide whether a decorative shape is acting as the
+// backdrop for another block.
+function boxContains(
+  outer: { x: number; y: number; w: number; h: number },
+  inner: { x: number; y: number; w: number; h: number },
+): boolean {
+  const eps = 0.005
+  return (
+    inner.x + eps >= outer.x &&
+    inner.y + eps >= outer.y &&
+    inner.x + inner.w <= outer.x + outer.w + eps &&
+    inner.y + inner.h <= outer.y + outer.h + eps
+  )
+}
+
+// Drop fallback-gray <p:sp> rectangles that sit inside a TableBlock's box.
+// PPTX decks routinely place a master/layout rectangle behind a content
+// region whose fill is a <a:schemeClr> (theme accent / table-style). We
+// can't resolve theme colors, so we paint those rects in SCHEME_COLOR_FALLBACK
+// — which then bleeds through the table's transparent cells as a gray slab.
+// Suppressing them lets the table render clean against the slide background;
+// real (srgb) accent rects are untouched.
+function dropTableBackdropLines(blocks: Block[]): Block[] {
+  const tables = blocks.filter((b): b is TableBlock => b.type === 'table')
+  if (tables.length === 0) return blocks
+  return blocks.filter((b) => {
+    if (b.type !== 'line') return true
+    if (b.color !== SCHEME_COLOR_FALLBACK) return true
+    return !tables.some((t) => boxContains(t, b))
+  })
 }
 
 // Slide-level background fill from <p:bg><p:bgPr><a:solidFill><a:srgbClr>.
